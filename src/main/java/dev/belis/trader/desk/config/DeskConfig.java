@@ -41,6 +41,8 @@ public interface DeskConfig {
 
     Risk risk();
 
+    Proposals proposals();
+
     interface Ib {
         String host();
 
@@ -79,11 +81,27 @@ public interface DeskConfig {
         /** The only Telegram user allowed to approve proposals. */
         @WithName("userId")
         long userId();
+
+        /** Long-poll Telegram for updates (button taps, commands). Off in tests, which feed updates directly. */
+        @WithDefault("true")
+        boolean polling();
     }
 
     interface Mcp {
+        /** Required in header X-Desk-Key on every request to the MCP endpoint. */
         @WithName("apiKey")
         String apiKey();
+
+        /** Requests per minute on the MCP endpoint: per API key when authenticated, per client IP otherwise. */
+        @WithName("rateLimitPerMinute")
+        @WithDefault("30")
+        int rateLimitPerMinute();
+    }
+
+    interface Proposals {
+        /** A PROPOSED proposal the owner has not decided on expires after this long. */
+        @WithDefault("30m")
+        Duration ttl();
     }
 
     interface Risk {

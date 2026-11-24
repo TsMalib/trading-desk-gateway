@@ -160,6 +160,12 @@ public class FakeBroker implements Broker {
         }
     }
 
+    /** A working order placed outside this service (blank orderRef), e.g. a manual stop entered in TWS. */
+    public synchronized BrokerOpenOrder addExternalOrder(long conid, Side action, String type, BigDecimal quantity,
+                                                         BigDecimal limit, BigDecimal aux) {
+        return toOpenOrder(newOrder("", conid, action, type, quantity, limit, aux, "GTC", 0, SUBMITTED));
+    }
+
     /** Fills the working order with this ref at {@code price}, whatever the quote. */
     public synchronized BrokerExecution fill(String orderRef, BigDecimal price) {
         FakeOrder o = findWorking(orderRef);
