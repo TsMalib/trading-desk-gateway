@@ -5,6 +5,7 @@ import io.smallrye.config.WithDefault;
 import io.smallrye.config.WithName;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.List;
@@ -25,6 +26,13 @@ public interface DeskConfig {
     /** paper | live. Shown in every Telegram message. */
     Mode mode();
 
+    /**
+     * Broker implementation: ibkr (TWS API) or fake (in-memory, tests). Build-time: it selects the
+     * CDI bean, so changing it needs a rebuild. Tests run with fake.
+     */
+    @WithDefault("ibkr")
+    String broker();
+
     Ib ib();
 
     Telegram telegram();
@@ -40,6 +48,26 @@ public interface DeskConfig {
 
         @WithName("clientId")
         int clientId();
+
+        /** reqMarketDataType: 1 live, 2 frozen, 3 delayed, 4 delayed-frozen. Delayed quotes are flagged. */
+        @WithName("marketDataType")
+        @WithDefault("1")
+        int marketDataType();
+
+        /** How long to wait for IBKR to answer one request. */
+        @WithName("requestTimeout")
+        @WithDefault("15s")
+        Duration requestTimeout();
+
+        /** How long to wait for nextValidId after the socket connects. */
+        @WithName("connectTimeout")
+        @WithDefault("10s")
+        Duration connectTimeout();
+
+        /** Reconnect backoff doubles from 1s up to this. */
+        @WithName("reconnectMaxBackoff")
+        @WithDefault("60s")
+        Duration reconnectMaxBackoff();
     }
 
     interface Telegram {

@@ -7,8 +7,8 @@ import org.eclipse.microprofile.health.Liveness;
 
 /**
  * Liveness: the app is up and reports which IBKR mode it runs in.
- * Readiness of the database comes from the built-in datasource check;
- * an IB Gateway connection check is added with the broker.
+ * Readiness comes from the built-in datasource check and
+ * {@link dev.belis.trader.desk.broker.BrokerHealthCheck} (IB Gateway connection).
  */
 @Liveness
 @ApplicationScoped
