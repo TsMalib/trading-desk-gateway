@@ -388,6 +388,7 @@ public class ProposalService {
             n.thesis = reason;
             n.proposedBy = "owner";
             n.riskResult = AuditWriter.toJson(riskResult);
+            n.createdAt = now;
             n.expiresAt = now.plus(Duration.ofMinutes(1));
             proposals.persist(n);
             proposals.flush();
@@ -642,6 +643,7 @@ public class ProposalService {
             fields.fill(n);
             n.riskResult = AuditWriter.toJson(riskResult);
             n.warnings = AuditWriter.toJson(warnings);
+            n.createdAt = now;
             if (passed) {
                 n.expiresAt = expiry(kind, c, now);
             } else {
@@ -667,7 +669,8 @@ public class ProposalService {
                 p.rewardRisk, checks, warnings.stream().map(ThirtyDayWarning::message).toList(), p.expiresAt);
     }
 
-    private void saveInstrument(ContractInfo c) {
+    /** Inserts or updates the instrument row (audited when it changes). Needs the caller's transaction. */
+    public void saveInstrument(ContractInfo c) {
         Instrument i = instruments.findById(c.conid());
         boolean isNew = i == null;
         if (isNew) {

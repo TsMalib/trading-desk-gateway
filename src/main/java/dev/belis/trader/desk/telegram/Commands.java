@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static dev.belis.trader.desk.telegram.ProposalMessages.esc;
 import static dev.belis.trader.desk.telegram.ProposalMessages.money;
@@ -154,10 +155,14 @@ public class Commands {
     }
 
     public String kill() {
-        boolean was = killSwitch.set(true, AuditActor.USER, "telegram /kill");
-        return messages.tag() + " 🛑 Kill switch <b>ON</b>" + (was ? " (it already was)" : "") + ".\n"
-                + "New entries are refused at proposal and at approval. Exits and stop moves still work. "
-                + "Working orders and positions are untouched: /flatten closes everything.";
+        KillSwitch.Engaged k = killSwitch.engage(AuditActor.USER, "telegram /kill");
+        String entries = !k.complete() ? "Cancelling working entries is still in progress; check /status."
+                : k.cancelled().isEmpty() ? "No entry orders were working."
+                : "Cancelled the unfilled part of " + esc(String.join(", ", k.cancelled())) + ".";
+        return messages.tag() + " 🛑 Kill switch <b>ON</b>" + (k.wasOn() ? " (it already was)" : "") + ".\n"
+                + "New entries are refused at proposal and at approval. " + entries + "\n"
+                + "Stops and targets of open positions stay; exits and stop moves still work. "
+                + "/flatten closes everything.";
     }
 
     public String resume() {
@@ -179,8 +184,8 @@ public class Commands {
                     false);
         }
         if (pv.positions().isEmpty() && pv.ourOrders().isEmpty()) {
-            return new FlattenPrompt(messages.tag() + " Nothing to flatten: no positions and no working orders "
-                    + "of ours.", false);
+            return new FlattenPrompt(messages.tag() + " Nothing to flatten: no positions bought by this service "
+                    + "and no working orders of ours.", false);
         }
         StringBuilder b = new StringBuilder(messages.tag()).append(" 🔥 <b>Flatten?</b>\n")
                 .append("This turns the kill switch on, cancels open proposals and ")
@@ -190,6 +195,10 @@ public class Commands {
         }
         if (pv.positions().isEmpty()) {
             b.append("\n• (no positions)");
+        }
+        if (!pv.otherPositions().isEmpty()) {
+            b.append("\nNot sold (EXTERNAL, never touched): ").append(esc(pv.otherPositions().stream()
+                    .map(p -> p.symbol() + " " + qty(p.quantity())).collect(Collectors.joining(", "))));
         }
         if (!pv.externalOrders().isEmpty()) {
             b.append("\n⚠️ ").append(pv.externalOrders().size()).append(" external order(s) are not touched; ")

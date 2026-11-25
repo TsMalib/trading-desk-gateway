@@ -92,6 +92,9 @@ class TelegramBotTest {
     @Inject
     TestDb db;
 
+    @Inject
+    dev.belis.trader.desk.proposal.OrderExecutor orderExecutor;
+
     FixedClock clock;
     final AtomicLong updateIds = new AtomicLong(100);
 
@@ -126,6 +129,22 @@ class TelegramBotTest {
 
     List<AuditLog> audit(String event) {
         return QuarkusTransaction.requiringNew().call(() -> auditLogs.list("event = ?1 order by id", event));
+    }
+
+    @Inject
+    dev.belis.trader.desk.store.PositionMetaRepository positionMetas;
+
+    /** Marks the position in {@code symbol} as bought by this service (position_meta origin GATEWAY). */
+    void gateway(String symbol) {
+        var c = fake.contract(symbol);
+        QuarkusTransaction.requiringNew().run(() -> {
+            service.saveInstrument(c);
+            var m = new dev.belis.trader.desk.store.PositionMeta();
+            m.conid = c.conid();
+            m.origin = dev.belis.trader.desk.store.PositionOrigin.GATEWAY;
+            m.openedAt = clock.instant();
+            positionMetas.persist(m);
+        });
     }
 
     Tg.Update tap(String data, long messageId) {
@@ -494,6 +513,7 @@ class TelegramBotTest {
             fake.placeBracket(new BracketOrder(900, AAPL, bd("10"), bd("100.50"), bd("120"), bd("90"))); // fills
             fake.placeBracket(new BracketOrder(901, MSFT, bd("5"), bd("390"), bd("450"), bd("370")));    // working
             fake.setPosition(TSLA, bd("3"), bd("240"));                                                  // external
+            gateway("AAPL");
         }
 
         Sent prompt() {
@@ -502,20 +522,22 @@ class TelegramBotTest {
         }
 
         @Test
-        void confirmCancelsAndSellsEverything() {
+        void confirmCancelsAndSellsEveryGatewayPosition() {
             long proposalId = proposeAapl().proposalId();
             book();
 
             Sent prompt = prompt();
             assertTrue(prompt.text().startsWith("[PAPER] 🔥 <b>Flatten?</b>"), prompt.text());
-            assertTrue(prompt.text().contains("• AAPL 10 sh\n• TSLA 3 sh"), prompt.text());
+            assertTrue(prompt.text().contains("• AAPL 10 sh\nNot sold (EXTERNAL, never touched): TSLA 3"),
+                    prompt.text());
             String confirm = callbackData(prompt.keyboard(), 0);
             assertTrue(confirm.startsWith("f:"), confirm);
 
             bot.handle(tap(confirm, prompt.messageId()));
 
             assertEquals("Flattening…", telegram.answered().get(0).text());
-            assertTrue(fake.positions().isEmpty(), fake.positions().toString());
+            assertEquals(List.of(TSLA), fake.positions().stream().map(p -> p.conid()).toList(),
+                    "the EXTERNAL position is never touched");
             assertTrue(fake.openOrders().isEmpty(), fake.openOrders().toString());
             assertTrue(killSwitch.isOn());
             assertEquals("CANCELLED", load(proposalId).status);
@@ -526,16 +548,18 @@ class TelegramBotTest {
             assertTrue(result.contains("Proposals cancelled: #" + proposalId), result);
             assertTrue(result.contains("P901-ENTRY"), result);
             assertTrue(result.contains("✅ AAPL: sold 10 at market (P"), result);
-            assertTrue(result.contains("✅ TSLA: sold 3 at market (P"), result);
-            assertFalse(result.contains("❗"), result);
+            assertTrue(result.contains("❗ TSLA: 3 not sold, not bought by this service (EXTERNAL, never touched)"),
+                    result);
 
             // the cancelled proposal's own message lost its buttons
             assertTrue(telegram.edited().stream().anyMatch(e -> e.text().contains("🚫 <b>CANCELLED</b>")));
 
+            // the order executor applies the market fills: sold, so CLOSED
+            orderExecutor.awaitIdle(java.time.Duration.ofSeconds(10));
             List<Proposal> exits = QuarkusTransaction.requiringNew().call(() ->
                     proposals.list("kind = ?1 order by id", ProposalKind.EXIT));
-            assertEquals(2, exits.size());
-            exits.forEach(p -> assertEquals("SUBMITTED", p.status));
+            assertEquals(1, exits.size());
+            exits.forEach(p -> assertEquals("CLOSED", p.status));
             List<BrokerOrder> orders = QuarkusTransaction.requiringNew().call(() -> brokerOrders.listAll());
             assertEquals(exits.stream().map(p -> "P" + p.id + "-EXIT").toList(),
                     orders.stream().map(o -> o.orderRef).sorted().toList());
@@ -546,6 +570,8 @@ class TelegramBotTest {
         void aPositionWithAnExternalSellOrderIsNotSold() {
             fake.setPosition(TSLA, bd("3"), bd("240"));
             fake.setPosition(AAPL, bd("10"), bd("100"));
+            gateway("TSLA");
+            gateway("AAPL");
             // a manual stop entered in TWS: not ours to cancel, and selling on top of it could leave us short
             fake.addExternalOrder(AAPL, Side.SELL, "STP", bd("10"), null, bd("90"));
             Sent prompt = prompt();
@@ -601,13 +627,14 @@ class TelegramBotTest {
             assertEquals(2, fake.positions().size());
 
             bot.handle(tap(callbackData(second.keyboard(), 0), second.messageId()));
-            assertTrue(fake.positions().isEmpty());
+            assertEquals(List.of(TSLA), fake.positions().stream().map(p -> p.conid()).toList(),
+                    "only the EXTERNAL position is left");
         }
 
         @Test
         void nothingToFlatten() {
             Sent s = prompt();
-            assertEquals("[PAPER] Nothing to flatten: no positions and no working orders of ours.", s.text());
+            assertEquals("[PAPER] Nothing to flatten: no positions bought by this service and no working orders of ours.", s.text());
             assertNull(s.keyboard());
         }
     }

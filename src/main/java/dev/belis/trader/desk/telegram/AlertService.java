@@ -100,7 +100,7 @@ public class AlertService {
     }
 
     /** Forgets what was sent, so the next alert of any text goes out (tests). */
-    void resetDedupe() {
+    public void resetDedupe() {
         lastSent.clear();
     }
 }

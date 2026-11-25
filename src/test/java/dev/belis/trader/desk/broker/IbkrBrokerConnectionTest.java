@@ -13,6 +13,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -23,6 +24,7 @@ class IbkrBrokerConnectionTest {
     private FakeTwsServer tws;
     private IbkrBroker broker;
     private final List<BrokerReconnected> events = new CopyOnWriteArrayList<>();
+    private final List<BrokerOrderEvent> orderEvents = new CopyOnWriteArrayList<>();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -107,14 +109,81 @@ class IbkrBrokerConnectionTest {
         assertThrows(BrokerUnavailableException.class, broker::allocateOrderId);
     }
 
+    private static final BracketOrder BRACKET = new BracketOrder(1, 265598, BigDecimal.TEN, BigDecimal.valueOf(100),
+            BigDecimal.valueOf(112), BigDecimal.valueOf(95));
+
     @Test
-    void writeMethodsAreNotImplementedYet() {
-        assertThrows(UnsupportedOperationException.class, () -> broker.cancel("P1-STOP"));
-        assertThrows(UnsupportedOperationException.class,
-                () -> broker.marketSell(1, BigDecimal.ONE, "P1-EXIT"));
-        assertThrows(UnsupportedOperationException.class, () -> broker.modifyStop("P1-STOP", BigDecimal.TEN));
-        assertThrows(UnsupportedOperationException.class, () -> broker.placeBracket(
-                new BracketOrder(1, 1, BigDecimal.ONE, BigDecimal.TEN, BigDecimal.valueOf(12), BigDecimal.valueOf(9))));
+    void writesSendNothingWhenNotConnected() {
+        assertThrows(BrokerUnavailableException.class, broker::nextOrderId);
+        assertThrows(BrokerUnavailableException.class,
+                () -> broker.placeBracket(BRACKET, new PlacedBracket(1, 2, 3)));
+        assertThrows(BrokerException.class, () -> broker.modifyStop("P1-STOP", BigDecimal.TEN));
+        assertThrows(BrokerException.class, () -> broker.cancel("P1-STOP"));
+    }
+
+    @Test
+    void bracketIsAcknowledgedWhenIbkrReportsAllThreeLegs() throws Exception {
+        broker = new IbkrBroker(settings(tws.port()), events::add, orderEvents::add, Clock.systemUTC());
+        tws.setNextValidId(500);
+        broker.start();
+        await("connected", broker::isConnected);
+        PlacedBracket ids = new PlacedBracket(broker.nextOrderId(), broker.nextOrderId(), broker.nextOrderId());
+        assertEquals(new PlacedBracket(500, 501, 502), ids);
+
+        var sent = java.util.concurrent.CompletableFuture.runAsync(() -> broker.placeBracket(BRACKET, ids));
+        while (!sent.isDone()) {
+            tws.sendOrderStatus(500, "Submitted", "0", "10");
+            tws.sendOrderStatus(501, "PreSubmitted", "0", "10");
+            tws.sendOrderStatus(502, "PreSubmitted", "0", "10");
+            Thread.sleep(50);
+        }
+        sent.get(); // no exception
+
+        await("status events", () -> orderEvents.stream().anyMatch(e -> e instanceof BrokerOrderEvent.Status s
+                && s.orderId() == 502 && "P1-STOP".equals(s.orderRef())));
+    }
+
+    @Test
+    void rejectionDuringPlacementIsThrownWithItsCode() throws Exception {
+        broker = new IbkrBroker(settings(tws.port()), events::add, orderEvents::add, Clock.systemUTC());
+        tws.setNextValidId(500);
+        broker.start();
+        await("connected", broker::isConnected);
+        PlacedBracket ids = new PlacedBracket(broker.nextOrderId(), broker.nextOrderId(), broker.nextOrderId());
+
+        var sent = java.util.concurrent.CompletableFuture.runAsync(() -> broker.placeBracket(BRACKET, ids));
+        while (!sent.isDone()) {
+            tws.sendError(502, 321, "Error validating request: The API interface is currently in Read-Only mode.");
+            Thread.sleep(50);
+        }
+        var e = assertThrows(java.util.concurrent.ExecutionException.class, sent::get);
+        assertEquals(321, assertInstanceOf(BrokerException.class, e.getCause()).code());
+        assertTrue(e.getCause().getMessage().contains("Read-Only"));
+    }
+
+    @Test
+    void noAcknowledgementMeansOutcomeUnknown() {
+        broker.start();
+        await("connected", broker::isConnected);
+        BrokerTimeoutException e = assertThrows(BrokerTimeoutException.class,
+                () -> broker.placeBracket(BRACKET, new PlacedBracket(broker.nextOrderId(), broker.nextOrderId(),
+                        broker.nextOrderId())));
+        assertTrue(e.getMessage().contains("outcome unknown"), e.getMessage());
+    }
+
+    @Test
+    void lateOrderErrorsBecomeEvents() throws Exception {
+        broker = new IbkrBroker(settings(tws.port()), events::add, orderEvents::add, Clock.systemUTC());
+        broker.start();
+        await("connected", broker::isConnected);
+
+        tws.sendError(777, 201, "Order rejected - reason: not enough margin");
+        tws.sendError(778, 202, "Order Canceled - reason:");
+        await("error event", () -> orderEvents.stream().anyMatch(ev -> ev instanceof BrokerOrderEvent.Error er
+                && er.orderId() == 777 && er.code() == 201));
+        Thread.sleep(200);
+        assertTrue(orderEvents.stream().noneMatch(ev -> ev instanceof BrokerOrderEvent.Error er && er.code() == 202),
+                "a cancel confirmation is not an error");
     }
 
     @Test

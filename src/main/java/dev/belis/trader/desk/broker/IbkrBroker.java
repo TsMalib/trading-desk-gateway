@@ -11,6 +11,7 @@ import com.ib.client.EReaderSignal;
 import com.ib.client.Execution;
 import com.ib.client.ExecutionFilter;
 import com.ib.client.Order;
+import com.ib.client.OrderCancel;
 import com.ib.client.OrderState;
 import com.ib.client.TickAttrib;
 import com.ib.client.TickType;
@@ -40,6 +41,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -53,6 +55,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -64,11 +67,13 @@ import java.util.stream.Collectors;
  *   <li>{@code ibkr-msgs}: waits on the {@link EReaderSignal} and dispatches to the single {@link Wrapper};
  *       callbacks complete {@link CompletableFuture}s keyed by reqId.</li>
  *   <li>{@code ibkr-connector}: connect, reconnect with backoff, connection watchdog.</li>
- *   <li>{@code ibkr-events}: fires {@link BrokerReconnected} so observers may call back into the broker.</li>
+ *   <li>{@code ibkr-events}: fires {@link BrokerReconnected} and {@link BrokerOrderEvent}s, in the order IBKR
+ *       sent them, so observers may call back into the broker.</li>
  * </ul>
  * Callers block on the future with {@code desk.ib.requestTimeout}.
  *
- * <p>Write methods are not implemented yet (the Gateway runs with READ_ONLY_API=yes in this stage).
+ * <p>Write methods need IB Gateway with READ_ONLY_API=no; while it is on, IBKR rejects every order (error 321).
+ * Prices go to the TWS API as double (its only type) at this boundary; everything else is BigDecimal.
  */
 @ApplicationScoped
 @IfBuildProperty(name = "desk.broker", stringValue = "ibkr", enableIfMissing = true)
@@ -104,8 +109,14 @@ public class IbkrBroker implements Broker {
         }
     }
 
+    /** Order statuses that mean IBKR accepted an order (or a change to it). */
+    private static final Set<String> ACCEPTED = Set.of("PreSubmitted", "Submitted", "Filled", "PendingCancel");
+    /** Order statuses after which the order no longer works. */
+    private static final Set<String> DONE = Set.of("Filled", "Cancelled", "ApiCancelled", "Inactive");
+
     private final Settings settings;
     private final Consumer<BrokerReconnected> reconnectListener;
+    private final Consumer<BrokerOrderEvent> orderListener;
     private final Clock clock;
     private final Wrapper wrapper = new Wrapper();
 
@@ -138,14 +149,31 @@ public class IbkrBroker implements Broker {
                 }
             });
 
+    /** An order as IBKR last reported it (openOrder): needed to modify it in place. */
+    private record OrderSnapshot(Contract contract, Order order, String status) {
+    }
+
+    /** Orders of this client by order id. */
+    private final ConcurrentMap<Integer, OrderSnapshot> snapshots = new ConcurrentHashMap<>();
+    /** orderRef by order id: orderStatus callbacks do not carry the ref. */
+    private final ConcurrentMap<Integer, String> refsByOrderId = new ConcurrentHashMap<>();
+    /** Live executions waiting for their commission report, by execId. */
+    private final ConcurrentMap<String, RawExecution> liveExecutions = new ConcurrentHashMap<>();
+
     @Inject
-    public IbkrBroker(DeskConfig config, Event<BrokerReconnected> reconnected) {
-        this(Settings.from(config.ib()), reconnected::fire, Clock.systemUTC());
+    public IbkrBroker(DeskConfig config, Event<BrokerReconnected> reconnected, Event<BrokerOrderEvent> orderEvents) {
+        this(Settings.from(config.ib()), reconnected::fire, orderEvents::fire, Clock.systemUTC());
     }
 
     IbkrBroker(Settings settings, Consumer<BrokerReconnected> reconnectListener, Clock clock) {
+        this(settings, reconnectListener, e -> { }, clock);
+    }
+
+    IbkrBroker(Settings settings, Consumer<BrokerReconnected> reconnectListener,
+               Consumer<BrokerOrderEvent> orderListener, Clock clock) {
         this.settings = settings;
         this.reconnectListener = reconnectListener;
+        this.orderListener = orderListener;
         this.clock = clock;
     }
 
@@ -191,7 +219,7 @@ public class IbkrBroker implements Broker {
         return state;
     }
 
-    /** Next order id from nextValidId. Used by the write methods of a later stage. */
+    /** Next order id from nextValidId. */
     int allocateOrderId() {
         int id = nextOrderId.getAndUpdate(v -> v < 0 ? v : v + 1);
         if (id < 0) {
@@ -325,6 +353,20 @@ public class IbkrBroker implements Broker {
                 reconnectListener.accept(ev);
             } catch (RuntimeException e) {
                 LOG.error("BrokerReconnected observer failed", e);
+            }
+        });
+    }
+
+    private void fireOrderEvent(BrokerOrderEvent ev) {
+        ExecutorService ex = events;
+        if (ex == null || ex.isShutdown()) {
+            return;
+        }
+        ex.execute(() -> {
+            try {
+                orderListener.accept(ev);
+            } catch (RuntimeException e) {
+                LOG.errorf(e, "BrokerOrderEvent observer failed for %s", ev);
             }
         });
     }
@@ -625,27 +667,231 @@ public class IbkrBroker implements Broker {
     }
 
     // ======================================================================
-    // Write methods: not in this stage
+    // Write methods
     // ======================================================================
 
+    /**
+     * A write waiting for IBKR to acknowledge every order id in it: an orderStatus or openOrder with an
+     * {@link #ACCEPTED} status, or, when {@code openOrderAck} is set (a modification), an openOrder that shows
+     * the change. An error for one of the ids fails it.
+     */
+    private static final class WriteReq extends Pending<Void> {
+        final Set<Integer> waiting = ConcurrentHashMap.newKeySet();
+        final Predicate<Order> openOrderAck;
+
+        WriteReq(String what, Collection<Integer> ids, Predicate<Order> openOrderAck) {
+            super(what);
+            waiting.addAll(ids);
+            this.openOrderAck = openOrderAck;
+        }
+
+        void acknowledge(int orderId) {
+            waiting.remove(orderId);
+            if (waiting.isEmpty()) {
+                future.complete(null);
+            }
+        }
+    }
+
+    /**
+     * Sends a write and waits for its acknowledgement. Not connected before sending: BrokerUnavailableException
+     * (nothing sent). No answer, or the connection lost after sending: BrokerTimeoutException (outcome unknown).
+     */
+    private void write(String what, List<Integer> orderIds, Predicate<Order> openOrderAck,
+                       Consumer<EClientSocket> send) {
+        EClientSocket c = requireConnected();
+        WriteReq req = new WriteReq(what, orderIds, openOrderAck);
+        orderIds.forEach(id -> pending.put(id, req));
+        try {
+            send.accept(c);
+            req.future.get(settings.requestTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new BrokerTimeoutException(what + ": sent, but IBKR did not acknowledge within "
+                    + settings.requestTimeout() + "; outcome unknown");
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof BrokerUnavailableException) {
+                throw new BrokerTimeoutException(what + ": connection lost after sending; outcome unknown");
+            }
+            if (e.getCause() instanceof BrokerException be) {
+                throw be;
+            }
+            throw new BrokerException(what + " failed: " + e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BrokerTimeoutException(what + ": interrupted after sending; outcome unknown");
+        } finally {
+            orderIds.forEach(id -> pending.remove(id, req));
+        }
+    }
+
     @Override
-    public PlacedBracket placeBracket(BracketOrder order) {
-        throw new UnsupportedOperationException("placeBracket is not implemented yet (read-only stage)");
+    public int nextOrderId() {
+        requireConnected();
+        return allocateOrderId();
+    }
+
+    private static Contract byConid(long conid) {
+        Contract c = new Contract();
+        c.conid((int) conid);
+        c.secType("STK");
+        c.exchange("SMART");
+        return c;
+    }
+
+    private static Order order(String ref, String action, String type, BigDecimal qty, String tif) {
+        Order o = new Order();
+        o.orderRef(ref);
+        o.action(action);
+        o.orderType(type);
+        o.totalQuantity(Decimal.get(qty));
+        o.tif(tif);
+        o.outsideRth(false);
+        return o;
+    }
+
+    @Override
+    public void placeBracket(BracketOrder b, PlacedBracket ids) {
+        if (b.quantity().signum() <= 0) {
+            throw new IllegalArgumentException("quantity must be positive");
+        }
+        if (b.stopPrice().compareTo(b.entryLimit()) >= 0 || b.targetPrice().compareTo(b.entryLimit()) <= 0) {
+            throw new IllegalArgumentException("need stop < entry < target: " + b);
+        }
+        Contract contract = byConid(b.conid());
+
+        Order parent = order(b.entryRef(), "BUY", "LMT", b.quantity(), "DAY");
+        parent.lmtPrice(b.entryLimit().doubleValue());
+        parent.transmit(false);
+
+        Order target = order(b.targetRef(), "SELL", "LMT", b.quantity(), "GTC");
+        target.lmtPrice(b.targetPrice().doubleValue());
+        target.parentId(ids.entryOrderId());
+        target.transmit(false);
+
+        Order stop = order(b.stopRef(), "SELL", "STP", b.quantity(), "GTC");
+        stop.auxPrice(b.stopPrice().doubleValue());
+        stop.parentId(ids.entryOrderId());
+        stop.transmit(true); // sends all three
+
+        refsByOrderId.put(ids.entryOrderId(), b.entryRef());
+        refsByOrderId.put(ids.targetOrderId(), b.targetRef());
+        refsByOrderId.put(ids.stopOrderId(), b.stopRef());
+        write("placeBracket " + b.entryRef(),
+                List.of(ids.entryOrderId(), ids.targetOrderId(), ids.stopOrderId()), null, c -> {
+                    c.placeOrder(ids.entryOrderId(), contract, parent);
+                    c.placeOrder(ids.targetOrderId(), contract, target);
+                    c.placeOrder(ids.stopOrderId(), contract, stop);
+                });
     }
 
     @Override
     public void modifyStop(String stopOrderRef, BigDecimal newStopPrice) {
-        throw new UnsupportedOperationException("modifyStop is not implemented yet (read-only stage)");
+        int id = workingOrderId(stopOrderRef);
+        OrderSnapshot s = snapshots.get(id);
+        if (!s.order().getOrderType().toUpperCase().startsWith("STP")) {
+            throw new IllegalArgumentException(stopOrderRef + " is not a stop order");
+        }
+        BigDecimal current = IbFormats.price(s.order().auxPrice());
+        if (current != null && newStopPrice.compareTo(current) < 0) {
+            throw new IllegalArgumentException("stops only move up: " + current + " -> " + newStopPrice);
+        }
+        double aux = newStopPrice.doubleValue();
+        Order o = s.order();
+        o.auxPrice(aux);
+        o.transmit(true);
+        modifyInPlace(id, () -> write("modifyStop " + stopOrderRef, List.of(id),
+                seen -> Math.abs(seen.auxPrice() - aux) < 1e-9, c -> c.placeOrder(id, s.contract(), o)));
+    }
+
+    /** The snapshot's Order was changed for the modification: if it fails, forget it so it is read again. */
+    private void modifyInPlace(int id, Runnable write) {
+        try {
+            write.run();
+        } catch (RuntimeException e) {
+            snapshots.remove(id);
+            throw e;
+        }
+    }
+
+    @Override
+    public void reduceQuantity(String orderRef, BigDecimal newQuantity) {
+        int id = workingOrderId(orderRef);
+        OrderSnapshot s = snapshots.get(id);
+        BigDecimal current = IbFormats.quantity(s.order().totalQuantity());
+        if (newQuantity.signum() <= 0 || (current != null && newQuantity.compareTo(current) >= 0)) {
+            throw new IllegalArgumentException("cannot change quantity of " + orderRef + " from " + current
+                    + " to " + newQuantity);
+        }
+        Order o = s.order();
+        o.totalQuantity(Decimal.get(newQuantity));
+        o.transmit(true);
+        modifyInPlace(id, () -> write("reduceQuantity " + orderRef, List.of(id),
+                seen -> IbFormats.quantity(seen.totalQuantity()) != null
+                        && IbFormats.quantity(seen.totalQuantity()).compareTo(newQuantity) == 0,
+                c -> c.placeOrder(id, s.contract(), o)));
     }
 
     @Override
     public void cancel(String orderRef) {
-        throw new UnsupportedOperationException("cancel is not implemented yet (read-only stage)");
+        int id = workingOrderId(orderRef);
+        requireConnected().cancelOrder(id, new OrderCancel());
     }
 
     @Override
-    public int marketSell(long conid, BigDecimal quantity, String orderRef) {
-        throw new UnsupportedOperationException("marketSell is not implemented yet (read-only stage)");
+    public void marketSell(long conid, BigDecimal quantity, String orderRef, int orderId) {
+        BigDecimal held = positions().stream().filter(p -> p.conid() == conid).map(BrokerPosition::quantity)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        if (quantity.signum() <= 0 || quantity.compareTo(held) > 0) {
+            throw new IllegalArgumentException("sell " + quantity + " but position is " + held);
+        }
+        Contract contract = byConid(conid);
+        Order o = order(orderRef, "SELL", "MKT", quantity, "DAY");
+        o.transmit(true);
+        refsByOrderId.put(orderId, orderRef);
+        write("marketSell " + orderRef, List.of(orderId), null, c -> c.placeOrder(orderId, contract, o));
+    }
+
+    /**
+     * The order id of this client's working order with {@code orderRef}, with its snapshot loaded. Asks IBKR for
+     * the open orders when the snapshot is not known yet (e.g. after a restart).
+     */
+    private int workingOrderId(String orderRef) {
+        Optional<Integer> id = findWorking(orderRef);
+        if (id.isEmpty()) {
+            openOrders(); // refreshes the snapshots through openOrder callbacks
+            id = findWorking(orderRef);
+        }
+        return id.orElseThrow(() -> new BrokerException("no working order of client " + settings.clientId()
+                + " with ref " + orderRef));
+    }
+
+    private Optional<Integer> findWorking(String orderRef) {
+        return snapshots.entrySet().stream()
+                .filter(e -> orderRef.equals(e.getValue().order().orderRef()))
+                .filter(e -> !DONE.contains(e.getValue().status()))
+                .map(Map.Entry::getKey)
+                .findFirst();
+    }
+
+    /** Joins a live execution with its commission report, or sends it without one after COMMISSION_WAIT. */
+    private void liveExecution(Contract contract, Execution execution) {
+        String execId = execution.execId();
+        RawExecution raw = new RawExecution(contract, execution);
+        if (commissions.containsKey(execId)) {
+            fireOrderEvent(new BrokerOrderEvent.Fill(toExecution(raw)));
+            return;
+        }
+        liveExecutions.put(execId, raw);
+        ScheduledExecutorService ex = connector;
+        if (ex != null && !ex.isShutdown()) {
+            ex.schedule(() -> {
+                RawExecution r = liveExecutions.remove(execId);
+                if (r != null) {
+                    LOG.warnf("No commission report for execution %s within %s", execId, COMMISSION_WAIT);
+                    fireOrderEvent(new BrokerOrderEvent.Fill(toExecution(r)));
+                }
+            }, COMMISSION_WAIT.toMillis(), TimeUnit.MILLISECONDS);
+        }
     }
 
     // ======================================================================
@@ -723,8 +969,12 @@ public class IbkrBroker implements Broker {
                 default -> {
                     if (id >= 0 && !informational(errorCode)) {
                         Pending<?> p = pending.get(id);
-                        if (p != null) {
+                        if (p != null && errorCode != 202) {
                             p.future.completeExceptionally(new BrokerException(errorCode, errorMsg));
+                        } else if (id > 0 && id < REQ_ID_BASE && errorCode != 202) {
+                            // an order error nobody is waiting for: a late rejection, a refused cancel, ...
+                            fireOrderEvent(new BrokerOrderEvent.Error(id, refsByOrderId.get(id), errorCode,
+                                    errorMsg));
                         }
                     }
                 }
@@ -777,9 +1027,26 @@ public class IbkrBroker implements Broker {
 
         @Override
         public void openOrder(int orderId, Contract contract, Order order, OrderState orderState) {
+            String status = orderState.getStatus();
+            if (orderId > 0 && order.clientId() == settings.clientId()) {
+                snapshots.put(orderId, new OrderSnapshot(contract, order, status));
+                String ref = IbFormats.blankToNull(order.orderRef());
+                if (ref != null) {
+                    refsByOrderId.put(orderId, ref);
+                }
+                WriteReq w = pendingAs(orderId, WriteReq.class);
+                if (w != null) {
+                    if (ACCEPTED.contains(status) && (w.openOrderAck == null || w.openOrderAck.test(order))) {
+                        w.acknowledge(orderId);
+                    } else if ("Inactive".equals(status) || "Cancelled".equals(status)) {
+                        w.future.completeExceptionally(new BrokerException(
+                                "order " + orderId + " (" + order.orderRef() + ") is " + status));
+                    }
+                }
+            }
             OpenOrdersReq r = pendingAs(OPEN_ORDERS_KEY, OpenOrdersReq.class);
             if (r == null) {
-                LOG.debugf("Unsolicited openOrder %d %s %s", orderId, order.orderRef(), orderState.getStatus());
+                LOG.debugf("Unsolicited openOrder %d %s %s", orderId, order.orderRef(), status);
                 return;
             }
             long key = order.permId() != 0 ? order.permId() : -orderId;
@@ -814,6 +1081,19 @@ public class IbkrBroker implements Broker {
                                 long permId, int parentId, double lastFillPrice, int clientId, String whyHeld,
                                 double mktCapPrice) {
             LOG.debugf("orderStatus %d perm %d %s filled %s remaining %s", orderId, permId, status, filled, remaining);
+            snapshots.computeIfPresent(orderId, (k, s) -> new OrderSnapshot(s.contract(), s.order(), status));
+            WriteReq w = pendingAs(orderId, WriteReq.class);
+            if (w != null) {
+                if (ACCEPTED.contains(status) && w.openOrderAck == null) {
+                    w.acknowledge(orderId);
+                } else if ("Inactive".equals(status) || "Cancelled".equals(status) || "ApiCancelled".equals(status)) {
+                    w.future.completeExceptionally(new BrokerException("order " + orderId + " is " + status
+                            + (whyHeld == null || whyHeld.isBlank() ? "" : " (" + whyHeld + ")")));
+                }
+            }
+            fireOrderEvent(new BrokerOrderEvent.Status(orderId, permId, refsByOrderId.get(orderId), status,
+                    IbFormats.quantity(filled), IbFormats.quantity(remaining), IbFormats.price(avgFillPrice),
+                    whyHeld));
         }
 
         // ---- executions -------------------------------------------------------
@@ -826,6 +1106,7 @@ public class IbkrBroker implements Broker {
             } else {
                 LOG.infof("Execution %s %s %s %s @ %s ref %s", execution.execId(), execution.side(),
                         execution.shares(), contract.symbol(), execution.price(), execution.orderRef());
+                liveExecution(contract, execution);
             }
         }
 
@@ -842,6 +1123,10 @@ public class IbkrBroker implements Broker {
             synchronized (commissions) {
                 commissions.put(report.execId(), report);
                 commissions.notifyAll();
+            }
+            RawExecution live = liveExecutions.remove(report.execId());
+            if (live != null) {
+                fireOrderEvent(new BrokerOrderEvent.Fill(toExecution(live)));
             }
         }
 

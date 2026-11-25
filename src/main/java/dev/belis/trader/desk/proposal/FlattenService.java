@@ -11,6 +11,9 @@ import dev.belis.trader.desk.store.AuditWriter;
 import dev.belis.trader.desk.store.BrokerOrder;
 import dev.belis.trader.desk.store.BrokerOrderRepository;
 import dev.belis.trader.desk.store.OrderRole;
+import dev.belis.trader.desk.store.PositionMeta;
+import dev.belis.trader.desk.store.PositionMetaRepository;
+import dev.belis.trader.desk.store.PositionOrigin;
 import dev.belis.trader.desk.store.Side;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -34,9 +37,11 @@ import java.util.stream.Collectors;
  *   <li>turns the kill switch on and cancels every PROPOSED or APPROVED proposal;</li>
  *   <li>cancels every working order this service placed (orderRef P&lt;id&gt;-ROLE), BUY entries first, and waits
  *       until IBKR no longer reports them;</li>
- *   <li>market-sells each long position IBKR then reports, its whole quantity, as an EXIT proposal of its own
- *       (orderRef P&lt;id&gt;-EXIT, approved by the owner).</li>
+ *   <li>market-sells each GATEWAY position (position_meta origin GATEWAY: bought by this service) IBKR then
+ *       reports, its whole quantity, as an EXIT proposal of its own (orderRef P&lt;id&gt;-EXIT, approved by the
+ *       owner).</li>
  * </ol>
+ * EXTERNAL positions, and positions the reconciler has not classified yet, are never sold.
  * A position that still has a working SELL order (an external order, or a cancel IBKR has not confirmed) is not
  * sold, so a stop cannot fire on top of the market sell and leave the account short. Orders without our
  * orderRef are never touched.
@@ -58,27 +63,44 @@ public class FlattenService {
     private final KillSwitch killSwitch;
     private final BrokerOrderRepository brokerOrders;
     private final AuditWriter audit;
+    private final OrderExecutor executor;
+    private final PositionMetaRepository positionMetas;
 
     public FlattenService(Broker broker, ProposalService proposals, KillSwitch killSwitch,
-                          BrokerOrderRepository brokerOrders, AuditWriter audit) {
+                          BrokerOrderRepository brokerOrders, AuditWriter audit, OrderExecutor executor,
+                          PositionMetaRepository positionMetas) {
         this.broker = broker;
         this.proposals = proposals;
         this.killSwitch = killSwitch;
         this.brokerOrders = brokerOrders;
         this.audit = audit;
+        this.executor = executor;
+        this.positionMetas = positionMetas;
     }
 
-    /** What a flatten would do now, for the confirmation prompt. */
-    public record Preview(List<BrokerPosition> positions, List<BrokerOpenOrder> ourOrders,
-                          List<BrokerOpenOrder> externalOrders) {
+    /**
+     * What a flatten would do now, for the confirmation prompt.
+     *
+     * @param positions      GATEWAY positions: sold
+     * @param otherPositions EXTERNAL or not yet classified positions: never touched
+     */
+    public record Preview(List<BrokerPosition> positions, List<BrokerPosition> otherPositions,
+                          List<BrokerOpenOrder> ourOrders, List<BrokerOpenOrder> externalOrders) {
     }
 
     /** @throws BrokerException when IBKR cannot be asked */
     public Preview preview() {
         List<BrokerPosition> positions = longPositions(broker.positions());
         List<BrokerOpenOrder> orders = broker.openOrders();
-        return new Preview(positions, orders.stream().filter(FlattenService::ours).toList(),
+        return new Preview(positions.stream().filter(this::gateway).toList(),
+                positions.stream().filter(p -> !gateway(p)).toList(),
+                orders.stream().filter(FlattenService::ours).toList(),
                 orders.stream().filter(o -> !ours(o)).toList());
+    }
+
+    private boolean gateway(BrokerPosition p) {
+        PositionMeta m = QuarkusTransaction.requiringNew().call(() -> positionMetas.findById(p.conid()));
+        return m != null && m.origin == PositionOrigin.GATEWAY;
     }
 
     /**
@@ -111,6 +133,7 @@ public class FlattenService {
                     .sorted(Comparator.comparing((BrokerOpenOrder o) -> o.action() == Side.BUY ? 0 : 1))
                     .toList();
             Set<String> cancelling = new LinkedHashSet<>();
+            executor.expectCancel(ourOrders.stream().map(BrokerOpenOrder::orderRef).toList());
             for (BrokerOpenOrder o : ourOrders) {
                 if (cancelling.contains(o.orderRef())) {
                     continue;
@@ -129,6 +152,11 @@ public class FlattenService {
             // 2. sell what IBKR reports now
             List<BrokerOpenOrder> stillWorking = broker.openOrders();
             for (BrokerPosition p : longPositions(broker.positions())) {
+                if (!gateway(p)) {
+                    notSold.add(p.symbol() + ": " + plain(p.quantity()) + " not sold, not bought by this service "
+                            + "(EXTERNAL, never touched)");
+                    continue;
+                }
                 List<BrokerOpenOrder> sells = stillWorking.stream()
                         .filter(o -> o.conid() == p.conid() && o.action() == Side.SELL).toList();
                 if (!sells.isEmpty()) {
@@ -185,7 +213,8 @@ public class FlattenService {
             return Line.notSold(p, "order " + ref + " already exists");
         }
         try {
-            int orderId = broker.marketSell(p.conid(), p.quantity(), ref);
+            // stored before it is sent, so its fill events find it
+            int orderId = broker.nextOrderId();
             QuarkusTransaction.requiringNew().run(() -> {
                 BrokerOrder o = new BrokerOrder();
                 o.proposalId = id;
@@ -195,11 +224,15 @@ public class FlattenService {
                 o.action = Side.SELL;
                 o.orderType = "MKT";
                 o.quantity = p.quantity();
-                o.status = "Submitted";
+                o.status = OrderExecutor.PENDING_SUBMIT;
                 brokerOrders.persist(o);
-                proposals.transition(id, ProposalStatus.SUBMITTED, AuditActor.SYSTEM,
-                        Map.of("orderRef", ref, "ibOrderId", orderId));
+                audit.write(AuditActor.SYSTEM, OrderExecutor.EVENT_ORDERS_STORED, id,
+                        Map.of("orders", List.of(ref + "=" + orderId), "quantity", p.quantity(), "via", "flatten"));
             });
+            broker.marketSell(p.conid(), p.quantity(), ref, orderId);
+            // only if still APPROVED: the order executor may already have applied the fill
+            QuarkusTransaction.requiringNew().run(() -> executor.markSubmitted(id, AuditActor.SYSTEM,
+                    Map.of("orderRef", ref, "ibOrderId", orderId)));
             return new Line(true, p.symbol() + ": sold " + plain(p.quantity()) + " at market (" + ref + ")");
         } catch (RuntimeException e) {
             LOG.errorf(e, "Flatten sell of %s failed", p.symbol());

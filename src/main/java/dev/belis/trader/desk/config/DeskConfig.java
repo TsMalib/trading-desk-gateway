@@ -43,6 +43,47 @@ public interface DeskConfig {
 
     Proposals proposals();
 
+    Orders orders();
+
+    Recon recon();
+
+    interface Recon {
+        /** Run a full reconcile once IBKR is connected after startup. Off in tests, which call it directly. */
+        @WithName("atStartup")
+        @WithDefault("true")
+        boolean atStartup();
+
+        /** How long the startup reconcile waits for the first IBKR connection before giving up. */
+        @WithName("startupWait")
+        @WithDefault("5m")
+        Duration startupWait();
+
+        /** The first reconcile (no previous run recorded) asks IBKR for executions this far back. */
+        @WithName("firstLookback")
+        @WithDefault("7d")
+        Duration firstLookback();
+    }
+
+    interface Orders {
+        /** EXIT: how long to wait for IBKR to confirm the cancel of the target and stop before selling. */
+        @WithName("cancelTimeout")
+        @WithDefault("10s")
+        Duration cancelTimeout();
+
+        /** Unfilled ENTRY parents are cancelled this many minutes before the day's close (from IBKR). */
+        @WithName("eodCancelMinutes")
+        @WithDefault("5")
+        int eodCancelMinutes();
+
+        /**
+         * The reconciler leaves an order alone this long after it was stored, before it concludes that IBKR
+         * never got it.
+         */
+        @WithName("submitGrace")
+        @WithDefault("2m")
+        Duration submitGrace();
+    }
+
     interface Ib {
         String host();
 

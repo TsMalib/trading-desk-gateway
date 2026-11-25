@@ -9,8 +9,8 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
-import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
@@ -82,9 +82,19 @@ public class Proposal {
     @Column(name = "expires_at")
     public Instant expiresAt;
 
-    @CreationTimestamp
+    /**
+     * Set from DeskClock by ProposalService, like every other time of a proposal, so created_at and expires_at
+     * come from the same clock. Falls back to the JVM clock only when a caller left it empty.
+     */
     @Column(name = "created_at", nullable = false, updatable = false)
     public Instant createdAt;
+
+    @PrePersist
+    void defaultCreatedAt() {
+        if (createdAt == null) {
+            createdAt = Instant.now();
+        }
+    }
 
     @Column(name = "decided_at")
     public Instant decidedAt;

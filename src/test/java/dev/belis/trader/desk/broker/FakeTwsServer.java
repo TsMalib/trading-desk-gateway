@@ -64,6 +64,12 @@ final class FakeTwsServer implements AutoCloseable {
         broadcast("4", "2", String.valueOf(id), String.valueOf(code), message);
     }
 
+    /** Sends an orderStatus (msg id 3, version 6 below server version 131) to every client. */
+    void sendOrderStatus(int orderId, String status, String filled, String remaining) throws IOException {
+        broadcast("3", "6", String.valueOf(orderId), status, filled, remaining, "0", "9" + orderId, "0", "0", "7",
+                "");
+    }
+
     private void acceptLoop() {
         while (!server.isClosed()) {
             try {

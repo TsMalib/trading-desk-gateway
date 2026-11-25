@@ -50,18 +50,66 @@ public interface Broker {
     ContractInfo contract(String symbol);
 
     // ---- write ------------------------------------------------------------
+    //
+    // Write calls wait until IBKR acknowledged the order (or rejected it). What they throw says what was sent:
+    //   BrokerUnavailableException  nothing was sent
+    //   BrokerTimeoutException      it was sent but IBKR did not answer: the outcome is unknown, check openOrders
+    //   BrokerException             IBKR rejected it (code() is the IBKR error code)
+    // Later news about an order (fills, status changes, late rejections) arrives as BrokerOrderEvent.
 
     /**
-     * Places parent LMT BUY (DAY) + child LMT SELL target (GTC) + child STP SELL stop (GTC).
-     * Parent and target transmit=false, stop transmit=true.
+     * Reserves the next IBKR order id, so the order can be stored before it is sent.
+     *
+     * @throws BrokerUnavailableException when not connected
      */
-    PlacedBracket placeBracket(BracketOrder order);
+    int nextOrderId();
 
-    /** Moves the stop of the working STP order with this ref. Stops only move up. */
+    /**
+     * Places parent LMT BUY (DAY) + child LMT SELL target (GTC) + child STP SELL stop (GTC) under the order ids
+     * reserved with {@link #nextOrderId()}. Parent and target transmit=false, stop transmit=true.
+     */
+    void placeBracket(BracketOrder order, PlacedBracket ids);
+
+    /** {@link #placeBracket(BracketOrder, PlacedBracket)} with freshly reserved ids. */
+    default PlacedBracket placeBracket(BracketOrder order) {
+        PlacedBracket ids = new PlacedBracket(nextOrderId(), nextOrderId(), nextOrderId());
+        placeBracket(order, ids);
+        return ids;
+    }
+
+    /**
+     * Moves the trigger of the working STP SELL order with this ref, in place (same order id).
+     *
+     * @throws IllegalArgumentException when the new stop is lower than the current one: stops only move up
+     */
     void modifyStop(String stopOrderRef, BigDecimal newStopPrice);
 
+    /**
+     * Lowers the quantity of the working order with this ref, in place.
+     *
+     * @throws IllegalArgumentException when {@code newQuantity} is not positive or not lower than the current one
+     */
+    void reduceQuantity(String orderRef, BigDecimal newQuantity);
+
+    /**
+     * Asks IBKR to cancel the working order with this ref. Returns once the request is sent: the order stays
+     * in {@link #openOrders()} (PendingCancel) until IBKR confirms; a refusal arrives as a BrokerOrderEvent.
+     *
+     * @throws BrokerException when no working order has this ref
+     */
     void cancel(String orderRef);
 
-    /** Market SELL; quantity must not exceed the position IBKR reports. Returns the IBKR order id. */
-    int marketSell(long conid, BigDecimal quantity, String orderRef);
+    /**
+     * Market SELL (DAY) under an order id reserved with {@link #nextOrderId()}.
+     *
+     * @throws IllegalArgumentException when {@code quantity} exceeds the position IBKR reports
+     */
+    void marketSell(long conid, BigDecimal quantity, String orderRef, int orderId);
+
+    /** {@link #marketSell(long, BigDecimal, String, int)} with a freshly reserved id; returns that id. */
+    default int marketSell(long conid, BigDecimal quantity, String orderRef) {
+        int id = nextOrderId();
+        marketSell(conid, quantity, orderRef, id);
+        return id;
+    }
 }

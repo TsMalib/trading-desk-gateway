@@ -1,0 +1,64 @@
+# trading-desk-gateway + cloudflared. Production Portainer stack (name: trading-desk).
+#
+# IB Gateway is NOT here: it runs in its own stack (ib-gateway.yml) so app releases never restart it.
+# Postgres is NOT here: the app connects to your existing Postgres via DESK_DB_URL.
+#
+# The image comes from GHCR (built by .github/workflows/release.yml on every v* tag); there is no
+# build: section. Every value, secrets included, is an environment variable set in the Portainer stack
+# (or, locally, a .env next to this file, which docker compose reads for ${...} substitution).
+# Roll back by setting DESK_VERSION to the previous tag and redeploying. See docs/portainer.md.
+#
+# Network exposure: nothing is published on the host. Only cloudflared reaches the app's HTTP port
+# (8080), over the stack's private edge network; Cloudflare Tunnel routes the public hostname to http://gateway:8080.
+
+name: trading-desk
+
+services:
+  gateway:
+    image: ghcr.io/${GHCR_OWNER:-tsmalib}/trading-desk-gateway:${DESK_VERSION:?set DESK_VERSION, e.g. v0.1.0}
+    restart: unless-stopped
+    environment:
+      DESK_MODE: ${DESK_MODE:?set DESK_MODE (paper|live)}
+      # ib-gateway container on the trading-desk network: 4004 paper, 4003 live.
+      IB_HOST: ${IB_HOST:-ib-gateway}
+      IB_PORT: ${IB_PORT:?set IB_PORT (4004 paper, 4003 live)}
+      IB_CLIENT_ID: ${IB_CLIENT_ID:-1}
+      IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-1}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID}
+      TELEGRAM_USER_ID: ${TELEGRAM_USER_ID:?set TELEGRAM_USER_ID}
+      MCP_API_KEY: ${MCP_API_KEY:?set MCP_API_KEY}
+      RISK_WHITELIST: ${RISK_WHITELIST:-}
+      DESK_DB_URL: ${DESK_DB_URL:?set DESK_DB_URL}
+      DESK_DB_USER: ${DESK_DB_USER:?set DESK_DB_USER}
+      DESK_DB_PASSWORD: ${DESK_DB_PASSWORD:?set DESK_DB_PASSWORD}
+    expose:
+      - "8080"
+    networks:
+      - trading-desk
+      - edge
+      # Uncomment when Postgres runs in a container on this host (see docs/portainer.md):
+      # - postgres
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.11.1
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN}
+    depends_on:
+      - gateway
+    # Only on edge: cloudflared reaches the app, not IB Gateway's API.
+    networks:
+      - edge
+
+networks:
+  trading-desk:
+    external: true
+  # Private to this stack: gateway <-> cloudflared.
+  edge:
+  # Uncomment together with "- postgres" above. name = the network your Postgres container is on
+  # (docker inspect <postgres-container> --format '{{json .NetworkSettings.Networks}}').
+  # postgres:
+  #   external: true
+  #   name: ${POSTGRES_NETWORK:-postgres_default}

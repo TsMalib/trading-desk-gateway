@@ -1,0 +1,72 @@
+# IB Gateway, deployed as its OWN Portainer stack (name: ib-gateway).
+#
+# It is separate from docker-compose.yml on purpose: redeploying the app never restarts IB Gateway, so an
+# app release never forces a new IBKR 2FA login. Restart this stack only to change credentials, mode or
+# version, and be ready to confirm 2FA on IBKR Mobile.
+#
+# Both stacks join the external network trading-desk; the app reaches this container as ib-gateway:4004
+# (paper) or ib-gateway:4003 (live). Inside the container IB Gateway only accepts API clients on 127.0.0.1;
+# the image's socat relay listens on 4003 -> 4001 (live) and 4004 -> 4002 (paper).
+#
+# Create the network once on the host:   docker network create trading-desk
+#
+# Every value comes from environment variables (Portainer stack variables, or a .env next to this file
+# for a local `docker compose -f ib-gateway.yml up -d`). See .env.example.
+
+name: ib-gateway
+
+services:
+  ib-gateway:
+    # Pinned exact version (stable channel 10.50, IBC 3.24.2; matches TwsApi.jar 10.50.01).
+    # Never :stable or :latest: upstream plans to replace IBC with ibcontroller (not before 2027-01-10),
+    # which changes the variables below. The stable tags are rebuilt weekly for OS patches; pin
+    # @sha256:<digest> as well if you want a byte-for-byte immutable image.
+    image: ghcr.io/gnzsnz/ib-gateway:10.50.1h
+    container_name: ib-gateway
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID:?set TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD:?set TWS_PASSWORD}
+      # paper | live. Must match DESK_MODE and IB_PORT of the app stack.
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      # The app places orders, so the API must not be read-only.
+      READ_ONLY_API: "no"
+      # Accept API connections without a dialog (only the trading-desk network can reach the API).
+      TWS_ACCEPT_INCOMING: accept
+      # Skip the API "precautions" warnings that would otherwise block orders.
+      BYPASS_WARNING: "yes"
+      # If the 2FA push is not confirmed in time, restart and send a new one instead of exiting.
+      TWOFA_TIMEOUT_ACTION: restart
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      # Daily restart without a new 2FA (IBKR still asks for one about once a week, on Sundays).
+      # Outside US market hours: 11:59 PM in TIME_ZONE.
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:59 PM}
+      # Take over if another session (e.g. TWS on your laptop) logs in with the same user.
+      EXISTING_SESSION_DETECTED_ACTION: primary
+      ALLOW_BLIND_TRADING: "no"
+      TIME_ZONE: ${TIME_ZONE:-Europe/Berlin}
+      TZ: ${TIME_ZONE:-Europe/Berlin}
+      JAVA_HEAP_SIZE: ${JAVA_HEAP_SIZE:-1024}
+      # Settings (jts.ini, API config) survive container re-creation in the named volume below.
+      TWS_SETTINGS_PATH: /home/ibgateway/tws_settings
+      SAVE_TWS_SETTINGS: SaveTwsSettingsAt=08:00 20:00
+      # Optional: VNC for looking at the Gateway UI when a login hangs. Empty = VNC off.
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+    volumes:
+      - ib-gateway-settings:/home/ibgateway/tws_settings
+    # Nothing on 0.0.0.0. The app uses the trading-desk network, not these ports.
+    # 127.0.0.1:4002 -> paper API, for IbkrBrokerPaperTest / mvn quarkus:dev on the host (via SSH tunnel).
+    # 127.0.0.1:5900 -> VNC (only active when VNC_SERVER_PASSWORD is set).
+    # The live API (4003) is deliberately not published.
+    ports:
+      - "127.0.0.1:4002:4004"
+      - "127.0.0.1:5900:5900"
+    networks:
+      - trading-desk
+
+volumes:
+  ib-gateway-settings:
+
+networks:
+  trading-desk:
+    external: true
