@@ -21,8 +21,11 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
-      # The install-tws profile installs lib/TwsApi.jar automatically; Dev Services starts Postgres
-      # with Testcontainers on the runner's Docker.
+      # lib/TwsApi.jar is not on Maven Central. It must be installed in a Maven run of its own: in the same
+      # run as verify, the dependencies are resolved before the install-tws profile's validate step runs.
+      - name: Install the TWS API jar
+        run: mvn -B validate
+      # Dev Services starts Postgres with Testcontainers on the runner's Docker.
       - run: mvn -B verify
 
   image:

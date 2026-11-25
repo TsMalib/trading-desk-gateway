@@ -181,7 +181,8 @@
 
           Activates automatically when the jar is missing from ~/.m2, or explicitly with
             mvn -Pinstall-tws validate
-          Runs in the validate phase, before any dependency is resolved for compilation.
+          Runs in the validate phase. Run `mvn validate` on its own first on a fresh machine (CI does):
+          a longer build in the same run resolves the dependencies before this step and fails.
         -->
         <profile>
             <id>install-tws</id>

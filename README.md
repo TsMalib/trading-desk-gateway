@@ -16,8 +16,11 @@ The TWS API is not on Maven Central. `lib/TwsApi.jar` and `lib/pom.xml` (from th
 API distribution, version 10.50.01) are installed into your local Maven repository as
 `com.interactivebrokers:tws-api:10.50.01`.
 
-This happens automatically: the `install-tws` profile in `pom.xml` activates when the jar
-is missing from `~/.m2` and installs it in the `validate` phase. To (re)install by hand:
+The `install-tws` profile in `pom.xml` activates when the jar is missing from `~/.m2` and
+installs it in the `validate` phase. On a fresh machine, run `mvn validate` once on its own first:
+any longer build (`mvn test`, `verify`, `quarkus:dev`) resolves the dependencies before `validate`
+runs and fails with "Could not find artifact com.interactivebrokers:tws-api". CI does the same
+(`.github/workflows/release.yml`). To (re)install by hand:
 
 ```
 mvn -Pinstall-tws validate
